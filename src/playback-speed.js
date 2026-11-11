@@ -46,6 +46,117 @@ let applying = false;
 let attachedVideo = null;
 let listenersBound = false;
 
+/*
+ * Some webOS media pipelines accept video.playbackRate and read it back, but
+ * keep decoding at 1x. The property cannot be trusted, so after every change
+ * the REAL rate is measured (currentTime against the wall clock) and, if the
+ * picture did not follow, the next strategy is tried.
+ */
+const STRATEGIES = ['direct', 'no-pitch-correction', 'default-rate', 'pause-apply-play'];
+const MEASURE_MS = 1500;
+let strategyIndex = 0;
+let verified = false;
+let hardwareLocked = false;
+let verifyToken = 0;
+let lastMeasured = null;
+
+function setPitchCorrection(video, on) {
+  try {
+    if ('preservesPitch' in video) video.preservesPitch = on;
+    if ('webkitPreservesPitch' in video) video.webkitPreservesPitch = on;
+    if ('mozPreservesPitch' in video) video.mozPreservesPitch = on;
+  } catch {
+    /* not fatal */
+  }
+}
+
+/** Resolve with the measured real-time rate, or null if it could not be measured. */
+function measureEffective(cb) {
+  const video = getVideo();
+  if (!video) return cb(null);
+  const t0 = video.currentTime;
+  const w0 = Date.now();
+  setTimeout(() => {
+    if (getVideo() !== video) return cb(null);
+    const wall = (Date.now() - w0) / 1000;
+    const advanced = video.currentTime - t0;
+    // Paused, buffering or seeked during the window: not a usable sample.
+    if (video.paused || wall <= 0 || advanced <= 0.05 || advanced > wall * MAX_SPEED * 1.5) {
+      return cb(null);
+    }
+    cb(advanced / wall);
+  }, MEASURE_MS);
+}
+
+/** Force the current strategy onto the pipeline. */
+function kickStrategy() {
+  const video = getVideo();
+  if (!video) return;
+  const rate = desiredSpeed;
+  if (STRATEGIES[strategyIndex] === 'pause-apply-play') {
+    try {
+      video.pause();
+      applySpeed(rate);
+      setTimeout(() => {
+        try {
+          const p = video.play();
+          if (p && typeof p.catch === 'function') p.catch(() => {});
+        } catch {
+          /* ignore */
+        }
+      }, 250);
+    } catch {
+      /* ignore */
+    }
+    return;
+  }
+  // Re-write the rate so the pipeline sees a change under the new settings.
+  applying = true;
+  try { video.playbackRate = 1; } catch { /* ignore */ }
+  applying = false;
+  applySpeed(rate);
+}
+
+function verifySpeed() {
+  const token = ++verifyToken;
+  if (desiredSpeed === DEFAULT_SPEED || verified || hardwareLocked) return;
+  let retries = 0;
+  const step = () => measureEffective((eff) => {
+    if (token !== verifyToken || desiredSpeed === DEFAULT_SPEED) return;
+    if (eff === null) {
+      if (++retries <= 8) step();
+      return;
+    }
+    lastMeasured = eff;
+    // Closer to what was asked than to 1x: the picture really changed.
+    if (Math.abs(eff - desiredSpeed) < Math.abs(eff - 1)) {
+      verified = true;
+      console.info('[Speed] verified via ' + STRATEGIES[strategyIndex] + ', measured ' + eff.toFixed(2));
+      if (strategyIndex > 0) {
+        showNotification(`Speed: ${formatSpeed(desiredSpeed)} (${STRATEGIES[strategyIndex]})`);
+      }
+      return;
+    }
+    if (strategyIndex >= STRATEGIES.length - 1) {
+      hardwareLocked = true;
+      strategyIndex = 0;
+      const video = getVideo();
+      if (video) {
+        setPitchCorrection(video, true);
+        try { video.defaultPlaybackRate = 1; } catch { /* ignore */ }
+      }
+      console.warn('[Speed] No strategy changed the real playback rate (measured ' + eff.toFixed(2) + 'x). Hardware pipeline is locked to 1x.');
+      showNotification('Speed not supported by this TV (stays at 1x)');
+      return;
+    }
+    strategyIndex++;
+    console.info('[Speed] measured ' + eff.toFixed(2) + 'x, trying ' + STRATEGIES[strategyIndex]);
+    kickStrategy();
+    setTimeout(step, STRATEGIES[strategyIndex] === 'pause-apply-play' ? 600 : 0);
+  });
+  step();
+}
+
 function getPlayer() {
   const el = document.getElementById(SELECTORS.PLAYER_ID);
   return el && el.isConnected ? el : null;
@@ -91,13 +202,16 @@ function applySpeed(rate, { notify = false } = {}) {
       }
     }
 
-    // Keep audio intelligible rather than chipmunked. Chromium 38 only has the
-    // prefixed form; both default to true, so this is belt and braces.
-    try {
-      if ('preservesPitch' in video) video.preservesPitch = true;
-      else if ('webkitPreservesPitch' in video) video.webkitPreservesPitch = true;
-    } catch {
-      /* not fatal */
+    // Keep audio intelligible rather than chipmunked, unless the active
+    // strategy is the one that needs pitch correction off.
+    const strategy = STRATEGIES[strategyIndex];
+    setPitchCorrection(video, !(strategy === 'no-pitch-correction' && rate !== DEFAULT_SPEED));
+    if (strategy === 'default-rate' || strategy === 'pause-apply-play') {
+      try { video.defaultPlaybackRate = rate; } catch { /* not fatal */ }
+    } else if (rate === DEFAULT_SPEED) {
+      try {
+        if (video.defaultPlaybackRate !== 1) video.defaultPlaybackRate = 1;
+      } catch { /* not fatal */ }
     }
 
     const ok = Math.abs(video.playbackRate - rate) <= 0.001;
@@ -129,7 +243,10 @@ function bindVideo() {
   attachedVideo = video;
   video.addEventListener('ratechange', onRateChange);
   // A fresh <video> starts at 1x; restore the session's choice.
-  if (desiredSpeed !== DEFAULT_SPEED) applySpeed(desiredSpeed);
+  if (desiredSpeed !== DEFAULT_SPEED) {
+    applySpeed(desiredSpeed);
+    if (verified && STRATEGIES[strategyIndex] === 'pause-apply-play') kickStrategy();
+  }
 }
 
 /** Set an absolute rate. */
@@ -137,10 +254,14 @@ export function setSpeed(rate, { notify = true } = {}) {
   if (!isWatchPage()) return false;
   desiredSpeed = clamp(Number(rate) || DEFAULT_SPEED);
   bindVideo();
-  const ok = applySpeed(desiredSpeed, { notify });
-  if (!ok && notify) {
+  const locked = hardwareLocked && desiredSpeed !== DEFAULT_SPEED;
+  const ok = applySpeed(desiredSpeed, { notify: notify && !locked });
+  if (locked && notify) {
+    showNotification('Speed not supported by this TV (stays at 1x)');
+  } else if (!ok && notify) {
     showNotification('Speed control unavailable for this video');
   }
+  verifySpeed();
   return ok;
 }
 
@@ -280,8 +401,16 @@ function diag() {
     out.rateRelatedFlags = 'threw: ' + e.message;
   }
 
-  console.info('[Speed] diagnostic', out);
-  return out;
+  out.strategy = STRATEGIES[strategyIndex];
+  out.verified = verified;
+  out.hardwareLocked = hardwareLocked;
+  return new Promise((resolve) => {
+    measureEffective((eff) => {
+      out.measured = { effectiveRate: eff, lastVerification: lastMeasured };
+      console.info('[Speed] diagnostic', out);
+      resolve(out);
+    });
+  });
 }
 
 

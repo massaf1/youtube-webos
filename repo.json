@@ -13,16 +13,16 @@
       "iconUri": "https://raw.githubusercontent.com/massaf1/youtube-webos/main/assets/icon.png",
       "manifest": {
         "id": "youtube.leanback.v4",
-        "version": "0.8.5",
+        "version": "0.8.6",
         "type": "web",
         "title": "YouTube AdFree (Speed-Test)",
         "appDescription": "YouTube AdFree 0.8.4 + aktivierte Wiedergabegeschwindigkeit (experimentell)",
         "iconUri": "https://raw.githubusercontent.com/massaf1/youtube-webos/main/assets/icon.png",
         "sourceUrl": "https://github.com/massaf1/youtube-webos",
         "rootRequired": false,
-        "ipkUrl": "https://raw.githubusercontent.com/massaf1/youtube-webos/main/dist/youtube.leanback.v4_0.8.5_all.ipk",
+        "ipkUrl": "https://raw.githubusercontent.com/massaf1/youtube-webos/main/dist/youtube.leanback.v4_0.8.6_all.ipk",
         "ipkHash": {
-          "sha256": "d13f943d5664f339e3cb4cdbf4c2e16234f9623af01fd0b1f39401a167577c4d"
+          "sha256": "55f9dc851f94626b87e23b588881a5adb2a35f7bc1d63836f203b0b3db5be3d8"
         }
       }
     }
