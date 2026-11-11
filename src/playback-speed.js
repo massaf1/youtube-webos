@@ -54,6 +54,7 @@ let listenersBound = false;
  */
 const STRATEGIES = ['direct', 'no-pitch-correction', 'default-rate', 'pause-apply-play'];
 const MEASURE_MS = 1500;
+const CONFIRM_MS = 6000;
 let strategyIndex = 0;
 let verified = false;
 let hardwareLocked = false;
@@ -71,21 +72,48 @@ function setPitchCorrection(video, on) {
 }
 
 /** Resolve with the measured real-time rate, or null if it could not be measured. */
-function measureEffective(cb) {
+function frameCount(video) {
+  try {
+    if (typeof video.getVideoPlaybackQuality === 'function') {
+      const q = video.getVideoPlaybackQuality();
+      if (q && typeof q.totalVideoFrames === 'number') return q.totalVideoFrames;
+    }
+    if (typeof video.webkitDecodedFrameCount === 'number') return video.webkitDecodedFrameCount;
+  } catch {
+    /* ignore */
+  }
+  return null;
+}
+
+let lastSampleInfo = '';
+
+function measureEffective(cb, windowMs) {
   const video = getVideo();
-  if (!video) return cb(null);
+  if (!video) { lastSampleInfo = 'no video'; return cb(null); }
   const t0 = video.currentTime;
+  const f0 = frameCount(video);
   const w0 = Date.now();
   setTimeout(() => {
-    if (getVideo() !== video) return cb(null);
+    if (getVideo() !== video) { lastSampleInfo = 'video changed'; return cb(null); }
     const wall = (Date.now() - w0) / 1000;
     const advanced = video.currentTime - t0;
+    const f1 = frameCount(video);
+    const fps = f0 !== null && f1 !== null && wall > 0 ? (f1 - f0) / wall : null;
+    lastSampleInfo = 'time ' + (wall > 0 ? (advanced / wall).toFixed(2) : '?') + 'x, ' +
+      (fps === null ? 'frames n/a' : fps.toFixed(0) + ' fps') +
+      (video.paused ? ', paused' : '');
     // Paused, buffering or seeked during the window: not a usable sample.
     if (video.paused || wall <= 0 || advanced <= 0.05 || advanced > wall * MAX_SPEED * 1.5) {
       return cb(null);
     }
     cb(advanced / wall);
-  }, MEASURE_MS);
+  }, windowMs || MEASURE_MS);
+}
+
+/** Test build: put every measurement on screen. */
+function debugNote(text) {
+  console.info('[Speed] ' + text);
+  showNotification('Speed check: ' + text, 12000);
 }
 
 /** Force the current strategy onto the pipeline. */
@@ -121,22 +149,41 @@ function verifySpeed() {
   const token = ++verifyToken;
   if (desiredSpeed === DEFAULT_SPEED || verified || hardwareLocked) return;
   let retries = 0;
+  let confirming = false;
   const step = () => measureEffective((eff) => {
     if (token !== verifyToken || desiredSpeed === DEFAULT_SPEED) return;
     if (eff === null) {
+      debugNote(STRATEGIES[strategyIndex] + ': no sample (' + lastSampleInfo + ')');
       if (++retries <= 8) step();
       return;
     }
     lastMeasured = eff;
+    debugNote(STRATEGIES[strategyIndex] + ': ' + lastSampleInfo);
     // Closer to what was asked than to 1x: the picture really changed.
     if (Math.abs(eff - desiredSpeed) < Math.abs(eff - 1)) {
-      verified = true;
-      console.info('[Speed] verified via ' + STRATEGIES[strategyIndex] + ', measured ' + eff.toFixed(2));
-      if (strategyIndex > 0) {
-        showNotification(`Speed: ${formatSpeed(desiredSpeed)} (${STRATEGIES[strategyIndex]})`);
+      // A short window can be fooled by a clock that is extrapolated from the
+      // requested rate and then snaps back. Confirm over a longer window
+      // before trusting it.
+      if (!confirming) {
+        confirming = true;
+        measureEffective((eff2) => {
+          if (token !== verifyToken || desiredSpeed === DEFAULT_SPEED) return;
+          debugNote(STRATEGIES[strategyIndex] + ' confirm: ' + lastSampleInfo);
+          if (eff2 === null || Math.abs(eff2 - desiredSpeed) < Math.abs(eff2 - 1)) {
+            verified = eff2 !== null;
+            if (verified) debugNote('OK via ' + STRATEGIES[strategyIndex]);
+            return;
+          }
+          lastMeasured = eff2;
+          escalate(eff2);
+        }, CONFIRM_MS);
       }
       return;
     }
+    escalate(eff);
+  });
+  const escalate = (eff) => {
+    confirming = false;
     if (strategyIndex >= STRATEGIES.length - 1) {
       hardwareLocked = true;
       strategyIndex = 0;
@@ -153,7 +200,7 @@ function verifySpeed() {
     console.info('[Speed] measured ' + eff.toFixed(2) + 'x, trying ' + STRATEGIES[strategyIndex]);
     kickStrategy();
     setTimeout(step, STRATEGIES[strategyIndex] === 'pause-apply-play' ? 600 : 0);
-  });
+  };
   step();
 }
 
